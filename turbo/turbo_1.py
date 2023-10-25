@@ -63,7 +63,6 @@ class Turbo1:
         device="cpu",
         dtype="float64",
     ):
-
         # Very basic input checks
         assert lb.ndim == 1 and ub.ndim == 1
         assert len(lb) == len(ub)
@@ -99,7 +98,9 @@ class Turbo1:
         self.mean = np.zeros((0, 1))
         self.signal_var = np.zeros((0, 1))
         self.noise_var = np.zeros((0, 1))
-        self.lengthscales = np.zeros((0, self.dim)) if self.use_ard else np.zeros((0, 1))
+        self.lengthscales = (
+            np.zeros((0, self.dim)) if self.use_ard else np.zeros((0, 1))
+        )
 
         # Tolerances and counters
         self.n_cand = min(100 * self.dim, 5000)
@@ -108,7 +109,7 @@ class Turbo1:
         self.n_evals = 0
 
         # Trust region sizes
-        self.length_min = 0.5 ** 7
+        self.length_min = 0.5**7
         self.length_max = 1.6
         self.length_init = 0.8
 
@@ -171,7 +172,11 @@ class Turbo1:
             X_torch = torch.tensor(X).to(device=device, dtype=dtype)
             y_torch = torch.tensor(fX).to(device=device, dtype=dtype)
             gp = train_gp(
-                train_x=X_torch, train_y=y_torch, use_ard=self.use_ard, num_steps=n_training_steps, hypers=hypers
+                train_x=X_torch,
+                train_y=y_torch,
+                use_ard=self.use_ard,
+                num_steps=n_training_steps,
+                hypers=hypers,
             )
 
             # Save state dict
@@ -181,14 +186,22 @@ class Turbo1:
         x_center = X[fX.argmin().item(), :][None, :]
         weights = gp.covar_module.base_kernel.lengthscale.cpu().detach().numpy().ravel()
         weights = weights / weights.mean()  # This will make the next line more stable
-        weights = weights / np.prod(np.power(weights, 1.0 / len(weights)))  # We now have weights.prod() = 1
+        weights = weights / np.prod(
+            np.power(weights, 1.0 / len(weights))
+        )  # We now have weights.prod() = 1
         lb = np.clip(x_center - weights * length / 2.0, 0.0, 1.0)
         ub = np.clip(x_center + weights * length / 2.0, 0.0, 1.0)
 
         # Draw a Sobolev sequence in [lb, ub]
         seed = np.random.randint(int(1e6))
         sobol = SobolEngine(self.dim, scramble=True, seed=seed)
-        pert = sobol.draw(self.n_cand).to(dtype=dtype, device=device).cpu().detach().numpy()
+        pert = (
+            sobol.draw(self.n_cand)
+            .to(dtype=dtype, device=device)
+            .cpu()
+            .detach()
+            .numpy()
+        )
         pert = lb + (ub - lb) * pert
 
         # Create a perturbation mask
@@ -211,9 +224,18 @@ class Turbo1:
         gp = gp.to(dtype=dtype, device=device)
 
         # We use Lanczos for sampling if we have enough data
-        with torch.no_grad(), gpytorch.settings.max_cholesky_size(self.max_cholesky_size):
+        with torch.no_grad(), gpytorch.settings.max_cholesky_size(
+            self.max_cholesky_size
+        ):
             X_cand_torch = torch.tensor(X_cand).to(device=device, dtype=dtype)
-            y_cand = gp.likelihood(gp(X_cand_torch)).sample(torch.Size([self.batch_size])).t().cpu().detach().numpy()
+            y_cand = (
+                gp.likelihood(gp(X_cand_torch))
+                .sample(torch.Size([self.batch_size]))
+                .t()
+                .cpu()
+                .detach()
+                .numpy()
+            )
 
         # Remove the torch variables
         del X_torch, y_torch, X_cand_torch, gp
@@ -247,7 +269,12 @@ class Turbo1:
             # Generate and evalute initial design points
             X_init = latin_hypercube(self.n_init, self.dim)
             X_init = from_unit_cube(X_init, self.lb, self.ub)
-            fX_init = np.array([[self.f(x)] for x in X_init])
+
+            # 1. Delay the tasks (send them to Celery, but don't wait for results)
+            async_results = [self.f.delay(x) for x in X_init]
+
+            # 2. Collect the results. This will wait for each task to complete.
+            fX_init = np.array([[result.get()] for result in async_results])
 
             # Update budget and set as initial data for this TR
             self.n_evals += self.n_init
@@ -273,7 +300,11 @@ class Turbo1:
 
                 # Create th next batch
                 X_cand, y_cand, _ = self._create_candidates(
-                    X, fX, length=self.length, n_training_steps=self.n_training_steps, hypers={}
+                    X,
+                    fX,
+                    length=self.length,
+                    n_training_steps=self.n_training_steps,
+                    hypers={},
                 )
                 X_next = self._select_candidates(X_cand, y_cand)
 
@@ -281,7 +312,11 @@ class Turbo1:
                 X_next = from_unit_cube(X_next, self.lb, self.ub)
 
                 # Evaluate batch
-                fX_next = np.array([[self.f(x)] for x in X_next])
+                # 1. Delay the tasks (send them to Celery, but don't wait for results)
+                async_results = [self.f.delay(x) for x in X_next]
+
+                # 2. Collect the results. This will wait for each task to complete.
+                fX_next = np.array([[result.get()] for result in async_results])
 
                 # Update trust region
                 self._adjust_length(fX_next)
